@@ -4,29 +4,24 @@ const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 const express = require('express');
 
-// ============================================================================
-// 1. CONFIGURATION
-// ============================================================================
-
+// Configuration
 const supabaseUrl = 'https://daxrnmvkpikjvvzgrhko.supabase.co';
-const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRheHJubXZrcGlranZ2emdyaGtvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA2OTkyNjEsImV4cCI6MjA3NjI3NTI2MX0.XWJ_aWUh5Eci5tQSRAATqDXmQ5nh2eHQGzYu6qMcsvQ';
+const supabaseKey = 'YOUR_SUPABASE_KEY';
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-const PM25_THRESHOLD = 20; // Alert threshold in µg/m³
-const FORECAST_HOUR = 12; // Check 12-hour forecast
-const SCAN_INTERVAL = 3 * 60 * 60 * 1000; // 3 hours in milliseconds
-const MESSAGE_DELAY = 3000; // 3 seconds between WhatsApp messages
+const PM25_THRESHOLD = 20;
+const FORECAST_HOUR = 12;
+const SCAN_INTERVAL = 3 * 60 * 60 * 1000;
+const MESSAGE_DELAY = 3000;
 
-// ============================================================================
-// 2. WHATSAPP CLIENT INITIALIZATION
-// ============================================================================
-
+// WhatsApp client
 const client = new Client({
     authStrategy: new LocalAuth({
         dataPath: './.wwebjs_auth'
     }),
-    puppeteer: { 
-        headless: true, // Required for Railway server environment
+    puppeteer: {
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
+        headless: true,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -40,65 +35,7 @@ const client = new Client({
     }
 });
 
-// ============================================================================
-// 3. WHATSAPP EVENT HANDLERS
-// ============================================================================
-
-client.on('qr', (qr) => {
-    console.log('='.repeat(60));
-    console.log('SCAN THIS QR CODE TO AUTHENTICATE WHATSAPP:');
-    console.log('='.repeat(60));
-    qrcode.generate(qr, { small: true });
-    console.log('='.repeat(60));
-    console.log('QR Code will expire in 60 seconds. Scan immediately!');
-    console.log('='.repeat(60));
-});
-
-client.on('authenticated', () => {
-    console.log('[SUCCESS] WhatsApp authenticated successfully');
-    botStatus.authenticated = true;
-    botStatus.lastAuthTime = new Date();
-});
-
-client.on('ready', async () => {
-    console.log('[SUCCESS] Bot is now online and ready');
-    botStatus.ready = true;
-    botStatus.startTime = new Date();
-    
-    console.log('[INFO] Waiting 10 seconds for session stability...');
-    await new Promise(r => setTimeout(r, 10000));
-    
-    console.log('[INFO] Executing first forecast scan...');
-    checkHazeAndAlert();
-    
-    // Schedule recurring scans every 3 hours
-    setInterval(checkHazeAndAlert, SCAN_INTERVAL);
-    console.log(`[INFO] Scheduled scans every ${SCAN_INTERVAL / (60 * 60 * 1000)} hours`);
-});
-
-client.on('disconnected', (reason) => {
-    console.error('[ERROR] WhatsApp disconnected:', reason);
-    botStatus.ready = false;
-    botStatus.lastDisconnect = new Date();
-    botStatus.disconnectReason = reason;
-    
-    console.log('[INFO] Attempting to reconnect in 30 seconds...');
-    setTimeout(() => {
-        console.log('[INFO] Reinitializing WhatsApp client...');
-        client.initialize();
-    }, 30000);
-});
-
-client.on('auth_failure', (error) => {
-    console.error('[ERROR] Authentication failed:', error);
-    botStatus.authenticated = false;
-    botStatus.authError = error.message;
-});
-
-// ============================================================================
-// 4. CORE ALERT LOGIC
-// ============================================================================
-
+// Bot state
 let botStatus = {
     authenticated: false,
     ready: false,
@@ -112,154 +49,154 @@ let botStatus = {
     authError: null
 };
 
+// WhatsApp events
+client.on('qr', (qr) => {
+    console.log('Scan QR code to authenticate');
+    qrcode.generate(qr, { small: true });
+});
+
+client.on('authenticated', () => {
+    botStatus.authenticated = true;
+    botStatus.lastAuthTime = new Date();
+    console.log('WhatsApp authenticated');
+});
+
+client.on('ready', async () => {
+    botStatus.ready = true;
+    botStatus.startTime = new Date();
+    console.log('WhatsApp client ready');
+
+    await new Promise(r => setTimeout(r, 10000));
+    checkHazeAndAlert();
+
+    setInterval(checkHazeAndAlert, SCAN_INTERVAL);
+});
+
+client.on('disconnected', (reason) => {
+    botStatus.ready = false;
+    botStatus.lastDisconnect = new Date();
+    botStatus.disconnectReason = reason;
+
+    console.error('WhatsApp disconnected:', reason);
+
+    setTimeout(() => {
+        client.initialize();
+    }, 30000);
+});
+
+client.on('auth_failure', (error) => {
+    botStatus.authenticated = false;
+    botStatus.authError = error.message;
+    console.error('Authentication failure:', error);
+});
+
+// Core scan
 async function checkHazeAndAlert() {
-    console.log('--- STARTING 12-HOUR FORECAST SCAN ---');
-    const scanStartTime = new Date();
-    botStatus.lastScanTime = scanStartTime;
-    
-    let scanResults = {
+    const scanStart = new Date();
+    botStatus.lastScanTime = scanStart;
+
+    let result = {
         citiesChecked: 0,
         alertsTriggered: 0,
         messagesSent: 0,
         errors: []
     };
-    
+
     try {
-        // Step A: Get all unique locations with active subscribers
-        const { data: subscriberLocations, error: locError } = await supabase
+        const { data: subscriberLocations, error } = await supabase
             .from('haze_alert_subscribers')
             .select('location');
 
-        if (locError) {
-            console.error('[ERROR] Database query failed:', locError.message);
-            throw locError;
-        }
-        
-        // De-duplicate cities
+        if (error) throw error;
+
         const uniqueCities = [...new Set(subscriberLocations.map(s => s.location))];
-        console.log(`[INFO] Checking forecasts for: ${uniqueCities.join(', ')}`);
-        
-        scanResults.citiesChecked = uniqueCities.length;
+        result.citiesChecked = uniqueCities.length;
 
-        for (const cityName of uniqueCities) {
+        for (const city of uniqueCities) {
             try {
-                // Step B: Fetch forecast from GNN API
-                const apiUrl = `https://haze-radargnnmodelrealtime-production-2194.up.railway.app/api/forecast/${cityName}`;
-                console.log(`[INFO] Fetching forecast for ${cityName}...`);
-                
-                const response = await axios.get(apiUrl, { 
-                    timeout: 15000 // 15 second timeout
-                });
+                const apiUrl = `https://haze-radargnnmodelrealtime-production-2194.up.railway.app/api/forecast/${city}`;
+                const response = await axios.get(apiUrl, { timeout: 15000 });
+
                 const forecasts = response.data;
+                const hourData = forecasts.find(f => f.hour === FORECAST_HOUR);
 
-                // Step C: Find the 12-hour forecast data
-                const hour12Data = forecasts.find(f => f.hour === FORECAST_HOUR);
+                if (!hourData) continue;
 
-                if (hour12Data) {
-                    const { pm25, aqi } = hour12Data;
+                if (hourData.pm25 > PM25_THRESHOLD) {
+                    result.alertsTriggered++;
 
-                    if (pm25 > PM25_THRESHOLD) {
-                        console.log(`[ALERT] ${cityName}: 12h PM2.5 is ${pm25} (threshold: ${PM25_THRESHOLD})`);
-                        scanResults.alertsTriggered++;
-                        
-                        const messageCount = await sendAlertsToCity(cityName, pm25, aqi);
-                        scanResults.messagesSent += messageCount;
-                        botStatus.totalAlertsSent += messageCount;
-                    } else {
-                        console.log(`[OK] ${cityName} is safe at hour 12 (PM2.5: ${pm25})`);
-                    }
-                } else {
-                    console.log(`[WARNING] No 12-hour forecast data available for ${cityName}`);
+                    const sent = await sendAlertsToCity(city, hourData.pm25, hourData.aqi);
+                    result.messagesSent += sent;
+                    botStatus.totalAlertsSent += sent;
                 }
             } catch (err) {
-                console.error(`[ERROR] API error for ${cityName}:`, err.message);
-                scanResults.errors.push({ city: cityName, error: err.message });
+                result.errors.push({ city, error: err.message });
             }
         }
     } catch (err) {
-        console.error('[ERROR] Scan failed:', err.message);
-        scanResults.errors.push({ general: err.message });
+        result.errors.push({ general: err.message });
     }
-    
-    const scanDuration = new Date() - scanStartTime;
-    console.log('--- SCAN COMPLETED ---');
-    console.log(`[SUMMARY] Cities checked: ${scanResults.citiesChecked}`);
-    console.log(`[SUMMARY] Alerts triggered: ${scanResults.alertsTriggered}`);
-    console.log(`[SUMMARY] Messages sent: ${scanResults.messagesSent}`);
-    console.log(`[SUMMARY] Errors: ${scanResults.errors.length}`);
-    console.log(`[SUMMARY] Duration: ${scanDuration}ms`);
-    
-    botStatus.lastScanResult = scanResults;
+
+    botStatus.lastScanResult = result;
 }
 
+// Send alerts
 async function sendAlertsToCity(cityName, pmValue, aqiValue) {
-    const { data: subscribers, error: subError } = await supabase
+    const { data: subscribers, error } = await supabase
         .from('haze_alert_subscribers')
         .select('full_name, whatsapp_no')
         .eq('location', cityName);
 
-    if (subError) {
-        console.error(`[ERROR] Failed to fetch subscribers for ${cityName}:`, subError.message);
-        return 0;
-    }
-    
-    if (!subscribers || subscribers.length === 0) {
-        console.log(`[INFO] No subscribers found for ${cityName}`);
-        return 0;
-    }
+    if (error || !subscribers) return 0;
 
     let successCount = 0;
-    
+
     for (const sub of subscribers) {
-        // Clean phone number (remove non-digits, handle 0 prefix)
-        let cleanPhone = sub.whatsapp_no.replace(/\D/g, ''); 
+        let cleanPhone = sub.whatsapp_no.replace(/\D/g, '');
+
         if (cleanPhone.startsWith('0')) {
-            cleanPhone = '62' + cleanPhone.substring(1); // Convert 08xxx to 628xxx
+            cleanPhone = '62' + cleanPhone.substring(1);
         }
-        
+
         const chatId = `${cleanPhone}@c.us`;
 
-        const alertMsg = `EXTREME POLLUTION ALERT
+        const message =
+`EXTREME POLLUTION ALERT
 
-Hi ${sub.full_name}, 
+Hi ${sub.full_name},
 In 12 hours the air quality in ${cityName} is predicted to have an AQI level of ${aqiValue}, and PM2.5 value of ${pmValue} µg/m³.
 
-Please stay safe and take precautions!`;
+Please stay safe and take precautions.`;
 
         try {
-            await client.sendMessage(chatId, alertMsg);
-            console.log(`   [SENT] Alert delivered to ${sub.full_name} (${cleanPhone})`);
+            await client.sendMessage(chatId, message);
             successCount++;
         } catch (err) {
-            console.error(`   [FAILED] Could not send to ${sub.full_name}: ${err.message}`);
+            console.error('Send failed:', sub.full_name, err.message);
         }
 
-        // 3-second delay to prevent WhatsApp spam detection
         await new Promise(r => setTimeout(r, MESSAGE_DELAY));
     }
-    
+
     return successCount;
 }
 
-// ============================================================================
-// 5. HEALTH CHECK HTTP SERVER
-// ============================================================================
-
+// Health server
 const app = express();
 
 app.get('/health', (req, res) => {
-    const uptime = botStatus.startTime 
-        ? Math.floor((new Date() - botStatus.startTime) / 1000) 
+    const uptime = botStatus.startTime
+        ? Math.floor((new Date() - botStatus.startTime) / 1000)
         : 0;
-    
-    const healthData = {
+
+    const health = {
         status: botStatus.ready ? 'running' : 'not_ready',
         authenticated: botStatus.authenticated,
         uptime_seconds: uptime,
         last_scan: botStatus.lastScanTime,
         last_scan_result: botStatus.lastScanResult,
         total_alerts_sent: botStatus.totalAlertsSent,
-        configuration: {
+        config: {
             pm25_threshold: PM25_THRESHOLD,
             forecast_hour: FORECAST_HOUR,
             scan_interval_hours: SCAN_INTERVAL / (60 * 60 * 1000)
@@ -270,9 +207,8 @@ app.get('/health', (req, res) => {
             auth_error: botStatus.authError
         }
     };
-    
-    const httpStatus = botStatus.ready ? 200 : 503;
-    res.status(httpStatus).json(healthData);
+
+    res.status(botStatus.ready ? 200 : 503).json(health);
 });
 
 app.get('/', (req, res) => {
@@ -281,34 +217,27 @@ app.get('/', (req, res) => {
         <head><title>HazeRadar WhatsApp Alert Bot</title></head>
         <body>
             <h1>HazeRadar WhatsApp Alert System</h1>
-            <p><strong>Status:</strong> ${botStatus.ready ? 'RUNNING' : 'NOT READY'}</p>
-            <p><strong>Authenticated:</strong> ${botStatus.authenticated ? 'YES' : 'NO'}</p>
-            <p><strong>Total Alerts Sent:</strong> ${botStatus.totalAlertsSent}</p>
-            <p><strong>Last Scan:</strong> ${botStatus.lastScanTime || 'Never'}</p>
-            <p><a href="/health">View Health Check (JSON)</a></p>
+            <p>Status: ${botStatus.ready ? 'RUNNING' : 'NOT READY'}</p>
+            <p>Authenticated: ${botStatus.authenticated}</p>
+            <p>Total Alerts Sent: ${botStatus.totalAlertsSent}</p>
+            <p>Last Scan: ${botStatus.lastScanTime || 'Never'}</p>
+            <p><a href="/health">Health JSON</a></p>
         </body>
         </html>
     `);
 });
 
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-    console.log(`[INFO] Health check server running on port ${PORT}`);
-    console.log(`[INFO] Access health endpoint at: http://localhost:${PORT}/health`);
+    console.log(`Health server running on port ${PORT}`);
 });
 
-// ============================================================================
-// 6. KEEP-ALIVE MECHANISM
-// ============================================================================
-
+// Keep alive
 setInterval(() => {
-    const timestamp = new Date().toISOString();
-    console.log(`[${timestamp}] Keep-alive: Bot is running (Ready: ${botStatus.ready}, Auth: ${botStatus.authenticated})`);
-}, 5 * 60 * 1000); // Log every 5 minutes
+    console.log(`Heartbeat ${new Date().toISOString()} ready=${botStatus.ready} auth=${botStatus.authenticated}`);
+}, 5 * 60 * 1000);
 
-// ============================================================================
-// 7. START WHATSAPP CLIENT
-// ============================================================================
-
-console.log('[INFO] Initializing WhatsApp client...');
+// Start client
+console.log('Initializing WhatsApp client');
 client.initialize();
